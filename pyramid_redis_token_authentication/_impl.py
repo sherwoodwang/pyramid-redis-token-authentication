@@ -1,7 +1,7 @@
 import pickle
-from zope.interface import implementer
-from pyramid.interfaces import IAuthenticationPolicy
 import redis
+from zope.interface import implementer, Interface
+from pyramid.interfaces import IAuthenticationPolicy, IAuthorizationPolicy
 from pyramid.security import Everyone, Authenticated
 from random import randint
 
@@ -54,14 +54,21 @@ class _Counterfoil:
         self.timeout = timeout
         self.last_user_agent = None
         self.last_address = None
-        self.notes = []
 
 
 class AuthenticationError(Exception):
     pass
 
 
-@implementer(IAuthenticationPolicy)
+class ITokenManager(Interface):
+    def revoke_token(self, token):
+        pass
+
+    def check_token(self, userid, token):
+        pass
+
+
+@implementer(IAuthenticationPolicy, ITokenManager)
 class RedisTokenAuthenticationPolicy:
     """A token-based authentication policy which maintains token table in Redis
 
@@ -77,12 +84,16 @@ class RedisTokenAuthenticationPolicy:
     def __init__(self,
                  redisurl,
                  sesskey='auth',
-                 counterfoil_checker=None):
+                 counterfoil_checker=None,
+                 callback=None):
         self._sesskey = sesskey
         self._connpool = redis.ConnectionPool.from_url(redisurl)
         self._counterfoil_checker = counterfoil_checker \
             if counterfoil_checker is not None else \
             lambda request, last_address, last_user_agent: True
+        self._callback = callback \
+            if callback is not None else \
+            lambda userid, request: []
 
     def _get_redis(self):
         return redis.Redis(connection_pool=self._connpool)
@@ -100,11 +111,9 @@ class RedisTokenAuthenticationPolicy:
         del request.session[self._sesskey]
 
     def authenticated_userid(self, request):
-        effective_principals = self.effective_principals(request)
-
-        for principal in effective_principals:
+        for principal in request.effective_principals:
             if principal.startswith('user:'):
-                return int(principal[len('user:'):])
+                return principal[len('user:'):]
 
         return None
 
@@ -149,6 +158,9 @@ class RedisTokenAuthenticationPolicy:
         principals.append(Authenticated)
         principals.append('user:{}'.format(counterfoil.user_id))
         principals.append('token:{}'.format(info.token))
+        principals += [additional_principal
+                       for principal in principals
+                       for additional_principal in self._callback(principal, request)]
 
         update = False
 
@@ -171,14 +183,14 @@ class RedisTokenAuthenticationPolicy:
                  request,
                  userid,
                  timeout=None,
-                 the_token_generator=token_generator):
+                 the_token_generator=token_generator,
+                 callback=None):
         if timeout is None:
             timeout = 7 * 24 * 60 * 60
 
         redis_server = self._get_redis()
 
-        if isinstance(userid, str):
-            userid = int(userid)
+        userid = str(userid)
 
         info = self._get_auth_record(request, create=True)  # type: _AuthRecord
 
@@ -195,8 +207,12 @@ class RedisTokenAuthenticationPolicy:
             else:
                 try:
                     counterfoil = pickle.loads(counterfoil)  # type: _Counterfoil
-                    counterfoil.timeout = timeout
-                    redis_server.set(info.token, pickle.dumps(counterfoil), ex=counterfoil.timeout)
+                    if counterfoil.user_id == info.user_id:
+                        counterfoil.timeout = timeout
+                        redis_server.set(info.token, pickle.dumps(counterfoil), ex=counterfoil.timeout)
+                    else:
+                        redis_server.delete(info.token)
+                        info.token = None
                 except pickle.UnpicklingError:
                     redis_server.delete(info.token)
                     info.token = None
@@ -210,6 +226,9 @@ class RedisTokenAuthenticationPolicy:
                 token = the_token_generator()
                 ret = redis_server.set(token, pickle.dumps(counterfoil), ex=counterfoil.timeout, nx=True)
             info.token = token
+
+        if info.token is not None:
+            callback(info.token)
 
         return []
 
@@ -226,6 +245,27 @@ class RedisTokenAuthenticationPolicy:
         redis_server = self._get_redis()
         redis_server.delete(token)
 
+    def validate_token(self, userid, token):
+        redis_server = self._get_redis()
+        counterfoil = redis_server.get(token)
+        if counterfoil is None:
+            return False
+
+        counterfoil = pickle.loads(counterfoil)  # type: _Counterfoil
+        if counterfoil.user_id != userid:
+            return False
+
+        return True
+
+
+def get_token_manager(request) -> RedisTokenAuthenticationPolicy:
+    return request.registry.getUtility(ITokenManager)
+
 
 def includeme(config):
-    config.set_authentication_policy(RedisTokenAuthenticationPolicy(config.get_settings()['redis.authentication.url']))
+    authentication_policy = RedisTokenAuthenticationPolicy(config.get_settings()['redis.authentication.url'])
+    config.set_authentication_policy(authentication_policy)
+
+    def register_token_manager():
+        config.registry.registerUtility(authentication_policy, ITokenManager)
+    config.action('register_token_manager', register_token_manager)
