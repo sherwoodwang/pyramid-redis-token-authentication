@@ -113,37 +113,38 @@ class RedisTokenAuthenticationPolicy:
     def __init__(self,
                  redis_url=None,
                  token_length=16,  # the length of access key would be 48 chars longer than token
-                 session_key='auth',
                  trusted_host=True,
-                 key_authentication_secret=None,
-                 key_header='X-Access-Key',
-                 key_header_for_setting='X-Set-Access-Key',
-                 key_parameter='access_key',
-                 key_cookie='access_key',
+                 authentication_secret=None,
+                 from_session_property='auth',
+                 from_header='X-Access-Key',
+                 to_header='X-Set-Access-Key',
+                 from_parameter='access_key',
+                 from_cookie='access_key',
                  counterfoil_checker=None,
                  callback=None):
         if redis_url is None:
             raise InvalidArgumentError
 
         self._token_length = token_length
-        self._session_key = session_key
         self._trusted_host = trusted_host
 
-        if key_authentication_secret is None:
-            key_authentication_secret = os.urandom(64)
-        if isinstance(key_authentication_secret, str):
-            self._key_authentication_secret = hashlib.sha512(key_authentication_secret.encode()).digest()
+        if authentication_secret is None:
+            authentication_secret = os.urandom(64)
+        if isinstance(authentication_secret, str):
+            self._authentication_secret = hashlib.sha512(authentication_secret.encode()).digest()
         else:
-            self._key_authentication_secret = key_authentication_secret
-        self._key_header = key_header
-        self._key_header_for_setting = key_header_for_setting
-        self._key_parameter = key_parameter
-        self._key_cookie = key_cookie
-        if self._key_cookie is not None:
-            if isinstance(self._key_cookie, CookieProfile):
-                self._key_cookie_profile = self._key_cookie
+            self._authentication_secret = authentication_secret
+
+        self._from_session_property = from_session_property
+        self._from_header = from_header
+        self._to_header = to_header
+        self._from_parameter = from_parameter
+        self._from_cookie = from_cookie
+        if self._from_cookie is not None:
+            if isinstance(self._from_cookie, CookieProfile):
+                self._cookie_profile = self._from_cookie
             else:
-                self._key_cookie_profile = CookieProfile(self._key_cookie, serializer=_LiteralValueSerializer)
+                self._cookie_profile = CookieProfile(self._from_cookie, serializer=_LiteralValueSerializer)
         self._connection_pool = redis.ConnectionPool.from_url(redis_url)
         self._counterfoil_checker = counterfoil_checker \
             if counterfoil_checker is not None else \
@@ -159,19 +160,22 @@ class RedisTokenAuthenticationPolicy:
         argnames = [
             'redis_url',
             'token_length',
-            'session_key',
             'trusted_host',
-            'key_authentication_secret',
-            'key_parameter',
-            'key_header',
-            'key_header_for_setting',
-            'key_cookie',
+            'authentication_secret',
+            'from_session_property',
+            'from_parameter',
+            'from_header',
+            'to_header',
+            'from_cookie',
         ]
 
         for argname in argnames:
             settingname = 'token_authentication.' + argname
             if settingname in settings:
                 defkwargs[argname] = settings[settingname]
+
+        if 'from_session_property' in defkwargs and defkwargs['from_session_property'] == '':
+            defkwargs['from_session_property'] = None
 
         if 'token_length' in defkwargs and not isinstance(defkwargs['token_length'], int):
             defkwargs['token_length'] = int(defkwargs['token_length'])
@@ -186,24 +190,25 @@ class RedisTokenAuthenticationPolicy:
         return redis.StrictRedis(connection_pool=self._connection_pool)
 
     def _get_auth_record_from_session(self, request, create=False):
-        if self._session_key is None:
+        if self._from_session_property is None:
             return None
 
         if self._trusted_host is not True and request.host not in self._trusted_host:
             return None
 
-        if create and self._session_key not in request.session:
-            request.session[self._session_key] = {}
+        if create and self._from_session_property not in request.session:
+            request.session[self._from_session_property] = {}
 
-        if self._session_key in request.session:
-            return _AuthRecord(request.session, self._session_key)
+        if self._from_session_property in request.session:
+            return _AuthRecord(request.session, self._from_session_property)
         else:
             return None
 
     def _clean_auth_record_from_session(self, request):
-        if self._session_key is None:
+        if self._from_session_property is None:
             return
-        del request.session[self._session_key]
+
+        del request.session[self._from_session_property]
 
     def _get_token_from_session(self, request):
         info = self._get_auth_record_from_session(request, False)
@@ -217,23 +222,23 @@ class RedisTokenAuthenticationPolicy:
         return info.token, user_id_checker
 
     def _get_token_from_access_key(self, request):
-        if self._key_authentication_secret is None:
+        if self._authentication_secret is None:
             return None, None
 
         access_key = None
 
         if access_key is None:
-            if self._key_header is not None:
-                access_key = request.headers.get(self._key_header, None)
+            if self._from_header is not None:
+                access_key = request.headers.get(self._from_header, None)
 
         if access_key is None:
-            if self._key_parameter is not None:
-                access_key = request.params.get(self._key_parameter, None)
+            if self._from_parameter is not None:
+                access_key = request.params.get(self._from_parameter, None)
 
         if access_key is None:
-            if self._key_cookie is not None:
+            if self._from_cookie is not None:
                 if self._trusted_host is True or request.host in self._trusted_host:
-                    access_key = self._key_cookie_profile(request).get_value()
+                    access_key = self._cookie_profile(request).get_value()
 
         if access_key is None:
             return None, None
@@ -254,7 +259,7 @@ class RedisTokenAuthenticationPolicy:
 
         provided_hmac = authentication_data[4:]
         expected_hmac = hmac.new(
-            self._key_authentication_secret,
+            self._authentication_secret,
             digestmod=hashlib.sha256,
             msg=token.encode() + user_id_hash).digest()
 
@@ -269,11 +274,11 @@ class RedisTokenAuthenticationPolicy:
     def generate_access_key(self, user_id, token):
         user_id_hash = self._generate_user_id_hash(user_id)
 
-        if self._key_authentication_secret is None:
+        if self._authentication_secret is None:
             return None
 
         return token + base64.b64encode(user_id_hash + hmac.new(
-            self._key_authentication_secret,
+            self._authentication_secret,
             digestmod=hashlib.sha256,
             msg=token.encode() + user_id_hash).digest(), b'_.').decode('ascii')
 
@@ -439,17 +444,17 @@ class RedisTokenAuthenticationPolicy:
         if access_key is not None:
             headers = []
 
-            if self._key_header_for_setting is not None:
-                headers.append((self._key_header_for_setting, access_key))
+            if self._to_header is not None:
+                headers.append((self._to_header, access_key))
 
-            if self._key_cookie is not None:
+            if self._from_cookie is not None:
                 if self._trusted_host is True or request.host in self._trusted_host:
                     cookie_settings = {}
 
                     if long_lifetime_cookie:
                         cookie_settings['max_age'] = timeout
 
-                    headers += self._key_cookie_profile(request).get_headers(access_key, **cookie_settings)
+                    headers += self._cookie_profile(request).get_headers(access_key, **cookie_settings)
             return headers
         else:
             return []
@@ -462,12 +467,12 @@ class RedisTokenAuthenticationPolicy:
 
         headers = []
 
-        if self._key_header_for_setting is not None:
-            headers.append((self._key_header_for_setting, ''))
+        if self._to_header is not None:
+            headers.append((self._to_header, ''))
 
-        if self._key_cookie is not None:
+        if self._from_cookie is not None:
             if self._trusted_host is True or request.host in self._trusted_host:
-                headers += self._key_cookie_profile(request).get_headers(None)
+                headers += self._cookie_profile(request).get_headers(None)
         return headers
 
     def revoke_token(self, token):
