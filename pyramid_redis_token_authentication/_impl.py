@@ -183,7 +183,7 @@ class RedisTokenAuthenticationPolicy:
         return factory
 
     def _get_redis(self):
-        return redis.Redis(connection_pool=self._connection_pool)
+        return redis.StrictRedis(connection_pool=self._connection_pool)
 
     def _get_auth_record_from_session(self, request, create=False):
         if self._session_key is None:
