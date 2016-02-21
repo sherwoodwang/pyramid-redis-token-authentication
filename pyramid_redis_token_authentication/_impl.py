@@ -177,6 +177,9 @@ class RedisTokenAuthenticationPolicy:
         if 'from_session_property' in defkwargs and defkwargs['from_session_property'] == '':
             defkwargs['from_session_property'] = None
 
+        if 'from_cookie' in defkwargs and defkwargs['from_cookie'] == '':
+            defkwargs['from_cookie'] = None
+
         if 'token_length' in defkwargs and not isinstance(defkwargs['token_length'], int):
             defkwargs['token_length'] = int(defkwargs['token_length'])
 
@@ -431,7 +434,8 @@ class RedisTokenAuthenticationPolicy:
                 token = the_token_generator(self._token_length)
                 ret = redis_server.set(token, pickle.dumps(counterfoil), ex=counterfoil.timeout, nx=True)
 
-        callback(token)
+        if callback is not None:
+            callback(token)
 
         info = self._get_auth_record_from_session(request, create=True)  # type: _AuthRecord
 
