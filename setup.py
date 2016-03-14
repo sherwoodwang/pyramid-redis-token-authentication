@@ -18,5 +18,4 @@ setup(name='pyramid_redis_token_authentication',
           'pyramid',
           'redis',
           'zope.interface',
-      ]
-      )
+      ])
