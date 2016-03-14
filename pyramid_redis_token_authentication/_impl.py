@@ -11,6 +11,7 @@ import base64
 import binascii
 from urllib.parse import quote as urlquote, unquote as urlunquote
 import os
+import sys
 
 
 basic_characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.'
@@ -169,10 +170,14 @@ class RedisTokenAuthenticationPolicy:
             'from_cookie',
         ]
 
-        for argname in argnames:
-            settingname = 'token_authentication.' + argname
-            if settingname in settings:
-                defkwargs[argname] = settings[settingname]
+        prefix = 'token_authentication.'
+        for name in settings:
+            if name.startswith(prefix):
+                argname = name[len(prefix):]
+                if argname in argnames:
+                    defkwargs[argname] = settings[name]
+                else:
+                    print('Unknown configuration key: {}'.format(name), file=sys.stderr)
 
         if 'from_session_property' in defkwargs and defkwargs['from_session_property'] == '':
             defkwargs['from_session_property'] = None

@@ -1,0 +1,1 @@
+Authenication policy for Pyramid which stores counterfoils of tokens in Redis.
