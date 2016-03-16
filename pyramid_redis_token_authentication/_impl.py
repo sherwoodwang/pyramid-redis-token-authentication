@@ -469,10 +469,15 @@ class RedisTokenAuthenticationPolicy:
             return []
 
     def forget(self, request):
-        info = self._get_auth_record_from_session(request)
-        if info is not None:
-            self.revoke_token(info.token)
-            self._clean_auth_record_from_session(request)
+        token, _ = self._get_token_from_access_key(request)
+
+        if token is not None:
+            self.revoke_token(token)
+
+        token, _ = self._get_token_from_session(request)
+        if token is not None:
+            self.revoke_token(token)
+        self._clean_auth_record_from_session(request)
 
         headers = []
 
