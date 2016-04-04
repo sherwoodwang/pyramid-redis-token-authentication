@@ -4,7 +4,7 @@ import os
 from setuptools import setup, find_packages
 
 setup(name='pyramid_redis_token_authentication',
-      version='0.1.2',
+      version='0.1.3',
       description='Authenication policy for Pyramid which stores counterfoils of tokens in Redis',
       classifiers=[
           "Programming Language :: Python",

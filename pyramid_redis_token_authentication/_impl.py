@@ -12,6 +12,8 @@ import binascii
 from urllib.parse import quote as urlquote, unquote as urlunquote
 import os
 import sys
+import importlib
+import re
 
 
 basic_characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.'
@@ -168,6 +170,7 @@ class RedisTokenAuthenticationPolicy:
             'from_header',
             'to_header',
             'from_cookie',
+            'callback',
         ]
 
         prefix = 'token_authentication.'
@@ -188,10 +191,17 @@ class RedisTokenAuthenticationPolicy:
         if 'token_length' in defkwargs and not isinstance(defkwargs['token_length'], int):
             defkwargs['token_length'] = int(defkwargs['token_length'])
 
+        if 'callback' in defkwargs and isinstance(defkwargs['callback'], str):
+            callback_format = re.compile('(?P<package>[a-zA-Z_.]+):(?P<function>[a-zA-Z_.]+)')
+            m = callback_format.match(defkwargs['callback'])
+            if m:
+                defkwargs['callback'] = getattr(importlib.import_module(m.group('package')), m.group('function'))
+
         def factory(**kwargs):
             realkwargs = defkwargs.copy()
             realkwargs.update(kwargs)
             return RedisTokenAuthenticationPolicy(**realkwargs)
+
         return factory
 
     def _get_redis(self):
