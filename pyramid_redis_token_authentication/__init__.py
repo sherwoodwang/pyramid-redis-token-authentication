@@ -1,2 +1,2 @@
-from ._impl import RedisTokenAuthenticationPolicy, ITokenManager, token_generator, get_token_manager, includeme, \
+from ._impl import RedisTokenAuthenticationPolicy, ITokenManager, get_token_manager, includeme, \
     InvalidArgumentError

@@ -1,10 +1,9 @@
 import pickle
 import redis
 from zope.interface import implementer, Interface
-from pyramid.interfaces import IAuthenticationPolicy, PHASE2_CONFIG
+from pyramid.interfaces import IAuthenticationPolicy
 from pyramid.security import Everyone, Authenticated
 from webob.cookies import CookieProfile
-from random import randint
 import hashlib
 import hmac
 import base64
@@ -14,53 +13,99 @@ import os
 import sys
 import importlib
 import re
+from Crypto.Cipher import AES
+from Crypto import Random
+from collections import namedtuple
+from weakref import finalize
 
 
-basic_characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.'
+AccessKey = namedtuple('AccessKey', ['user_id', 'token'])
 
 
-def token_generator(length):
-    return ''.join([basic_characters[randint(0, len(basic_characters) - 1)] for i in range(length)])
+class AccessKeyAlgorithm:
+    def __init__(self, secret, token_length):
+        self.secret = secret
+        self.token_length = token_length
+
+        self.encryption_key = hmac.new(
+            secret,
+            digestmod=hashlib.sha256,
+            msg='Encryption Key'.encode('ascii')).digest()
+        self.authentication_key = hmac.new(
+            secret,
+            digestmod=hashlib.sha256,
+            msg='Authentication Key'.encode('ascii')).digest()
+
+    def load(self, data):
+        if not isinstance(data, str):
+            raise InvalidArgumentError
+
+        try:
+            data = base64.b64decode(data.encode('ascii'), b'_.')
+        except binascii.Error:
+            return None
+
+        provided_hmac = data[:32]
+        data = data[32:]
+
+        expected_hmac = hmac.new(
+            self.authentication_key,
+            digestmod=hashlib.sha256,
+            msg=data).digest()
+
+        if not hmac.compare_digest(provided_hmac, expected_hmac):
+            return None
+
+        iv = data[:AES.block_size]
+        data = data[AES.block_size:]
+
+        cipher = AES.new(self.encryption_key, AES.MODE_CFB, iv)
+        data = cipher.decrypt(data)
+
+        if len(data) < self.token_length + 1:
+            return None
+
+        token = data[:self.token_length]
+
+        try:
+            user_id = data[self.token_length:].decode('utf-8')
+        except UnicodeEncodeError:
+            return None
+
+        return AccessKey(user_id, token)
+
+    def generate(self, data):
+        if not isinstance(data, AccessKey):
+            raise InvalidArgumentError
+
+        if not isinstance(data.token, bytes):
+            raise InvalidArgumentError
+
+        if len(data.token) != self.token_length:
+            raise InvalidArgumentError
+
+        data = data.token + data.user_id.encode('utf-8')
+
+        iv = Random.get_random_bytes(AES.block_size)
+        cipher = AES.new(self.encryption_key, AES.MODE_CFB, iv)
+
+        data = cipher.encrypt(data)
+
+        data = iv + data
+
+        the_hmac = hmac.new(
+            self.authentication_key,
+            digestmod=hashlib.sha256,
+            msg=data).digest()
+
+        data = the_hmac + data
+
+        data = base64.b64encode(data, b'_.').decode('ascii')
+
+        return data
 
 
-class _AuthRecord:
-    def __init__(self, session, key):
-        self._session = session
-        self._key = key
-        self._storage = session[key]
-
-    def set(self, name, value):
-        if value is None:
-            if name in self._storage:
-                del self._storage[name]
-        else:
-            self._storage[name] = value
-            self._session.changed()
-
-    def get(self, name, default=None):
-        if name in self._storage:
-            return self._storage[name]
-        else:
-            return default
-
-    @property
-    def user_id(self):
-        return self.get('user_id')
-
-    @user_id.setter
-    def user_id(self, value):
-        self.set('user_id', value)
-
-    @property
-    def token(self):
-        return self.get('token')
-
-    @token.setter
-    def token(self, value):
-        self.set('token', value)
-
-
-class _Counterfoil:
+class Counterfoil:
     def __init__(self, user_id, timeout):
         self.user_id = user_id
         self.timeout = timeout
@@ -79,18 +124,12 @@ class ITokenManager(Interface):
     def check_token(self, userid, token):
         pass
 
-    def generate_access_key(self, userid, token):
-        pass
-
-    def parse_principals(self, principals):
-        pass
-
 
 class InvalidArgumentError(BaseException):
     pass
 
 
-class _LiteralValueSerializer:
+class LiteralValueSerializer:
     @staticmethod
     def dumps(value):
         return urlquote(value).encode('ascii')
@@ -116,12 +155,9 @@ class RedisTokenAuthenticationPolicy:
     def __init__(self,
                  redis_url=None,
                  token_length=16,  # the length of access key would be 48 chars longer than token
-                 trusted_host=True,
-                 authentication_secret=None,
-                 from_session_property='auth',
+                 secret=None,
                  from_header='X-Access-Key',
                  to_header='X-Set-Access-Key',
-                 from_parameter='access_key',
                  from_cookie='access_key',
                  counterfoil_checker=None,
                  callback=None):
@@ -129,32 +165,35 @@ class RedisTokenAuthenticationPolicy:
             raise InvalidArgumentError
 
         self._token_length = token_length
-        self._trusted_host = trusted_host
 
-        if authentication_secret is None:
-            authentication_secret = os.urandom(64)
-        if isinstance(authentication_secret, str):
-            self._authentication_secret = hashlib.sha512(authentication_secret.encode()).digest()
+        if secret is None:
+            secret = os.urandom(64)
+        if isinstance(secret, str):
+            self._secret = secret.encode('utf-8')
         else:
-            self._authentication_secret = authentication_secret
+            self._secret = secret
 
-        self._from_session_property = from_session_property
+        self._access_key_algorithm = AccessKeyAlgorithm(self._secret, self._token_length)
+
         self._from_header = from_header
         self._to_header = to_header
-        self._from_parameter = from_parameter
         self._from_cookie = from_cookie
         if self._from_cookie is not None:
             if isinstance(self._from_cookie, CookieProfile):
                 self._cookie_profile = self._from_cookie
             else:
-                self._cookie_profile = CookieProfile(self._from_cookie, serializer=_LiteralValueSerializer)
+                self._cookie_profile = CookieProfile(self._from_cookie, serializer=LiteralValueSerializer)
+
         self._connection_pool = redis.ConnectionPool.from_url(redis_url)
+
         self._counterfoil_checker = counterfoil_checker \
             if counterfoil_checker is not None else \
             lambda request, last_address, last_user_agent: True
         self._callback = callback \
             if callback is not None else \
             lambda userid, request: []
+
+        self._request_properties = {}
 
     @staticmethod
     def from_settings(settings):
@@ -163,10 +202,7 @@ class RedisTokenAuthenticationPolicy:
         argnames = [
             'redis_url',
             'token_length',
-            'trusted_host',
-            'authentication_secret',
-            'from_session_property',
-            'from_parameter',
+            'secret',
             'from_header',
             'to_header',
             'from_cookie',
@@ -181,9 +217,6 @@ class RedisTokenAuthenticationPolicy:
                     defkwargs[argname] = settings[name]
                 else:
                     print('Unknown configuration key: {}'.format(name), file=sys.stderr)
-
-        if 'from_session_property' in defkwargs and defkwargs['from_session_property'] == '':
-            defkwargs['from_session_property'] = None
 
         if 'from_cookie' in defkwargs and defkwargs['from_cookie'] == '':
             defkwargs['from_cookie'] = None
@@ -207,186 +240,141 @@ class RedisTokenAuthenticationPolicy:
     def _get_redis(self):
         return redis.StrictRedis(connection_pool=self._connection_pool)
 
-    def _get_auth_record_from_session(self, request, create=False):
-        if self._from_session_property is None:
-            return None
+    def _free_properties(self, request_id):
+        if request_id in self._request_properties:
+            del self._request_properties[request_id]
 
-        if self._trusted_host is not True and request.host not in self._trusted_host:
-            return None
+    def _get_properties(self, request):
+        req_id = id(request)
 
-        if create and self._from_session_property not in request.session:
-            request.session[self._from_session_property] = {}
-
-        if self._from_session_property in request.session:
-            return _AuthRecord(request.session, self._from_session_property)
+        if req_id in self._request_properties:
+            return self._request_properties[req_id]
         else:
-            return None
+            finalize(request, self._free_properties, req_id)
+            properties = {}
+            self._request_properties[req_id] = properties
+            return properties
 
-    def _clean_auth_record_from_session(self, request):
-        if self._from_session_property is None:
-            return
+    def _get_property(self, request, name, loader):
+        request_properties = self._get_properties(request)
 
-        del request.session[self._from_session_property]
+        if name in request_properties:
+            return request_properties[name]
 
-    def _get_token_from_session(self, request):
-        info = self._get_auth_record_from_session(request, False)
+        value = loader()
+        request_properties[name] = value
+        return value
 
-        if info is None:
-            return None, None
+    def _load_access_key(self, request):
+        def do_load():
+            access_key = None
 
-        def user_id_checker(user_id):
-            return user_id == info.user_id
+            if access_key is None:
+                if self._from_header is not None:
+                    access_key = request.headers.get(self._from_header, None)
 
-        return info.token, user_id_checker
-
-    def _get_token_from_access_key(self, request):
-        if self._authentication_secret is None:
-            return None, None
-
-        access_key = None
-
-        if access_key is None:
-            if self._from_header is not None:
-                access_key = request.headers.get(self._from_header, None)
-
-        if access_key is None:
-            if self._from_parameter is not None:
-                access_key = request.params.get(self._from_parameter, None)
-
-        if access_key is None:
-            if self._from_cookie is not None:
-                if self._trusted_host is True or request.host in self._trusted_host:
+            if access_key is None:
+                if self._from_cookie is not None:
                     access_key = self._cookie_profile(request).get_value()
 
-        if access_key is None:
-            return None, None
+            if access_key is None:
+                return None
 
-        token = access_key[:self._token_length]
+            return self._access_key_algorithm.load(access_key)
 
-        try:
-            authentication_data = access_key[self._token_length:].encode('ascii')
-        except UnicodeEncodeError:
-            return None, None
+        return self._get_property(request, 'access_key', do_load)
 
-        try:
-            authentication_data = base64.b64decode(authentication_data, b'_.')
-        except binascii.Error:
-            return None, None
+    def _load_counterfoil(self, request, access_key):
+        def do_load():
+            if access_key is None:
+                return None
 
-        user_id_hash = authentication_data[:4]
+            redis_server = self._get_redis()
+            counterfoil = redis_server.get(access_key.token)
 
-        provided_hmac = authentication_data[4:]
-        expected_hmac = hmac.new(
-            self._authentication_secret,
-            digestmod=hashlib.sha256,
-            msg=token.encode() + user_id_hash).digest()
+            if counterfoil is None:
+                return None
 
-        if not hmac.compare_digest(expected_hmac, provided_hmac):
-            return None, None
+            try:
+                counterfoil = pickle.loads(counterfoil)  # type: Counterfoil
+            except pickle.UnpicklingError:
+                return None
 
-        def user_id_checker(user_id):
-            return user_id_hash == self._generate_user_id_hash(user_id)
+            if counterfoil.user_id != access_key.user_id:
+                self.revoke_token(access_key.token)
+                return None
 
-        return token, user_id_checker
+            updated = False
 
-    def generate_access_key(self, user_id, token):
-        user_id_hash = self._generate_user_id_hash(user_id)
+            if counterfoil.last_user_agent != request.user_agent:
+                counterfoil.last_user_agent = request.user_agent
+                updated = True
 
-        if self._authentication_secret is None:
-            return None
+            if counterfoil.last_address != request.client_addr:
+                counterfoil.last_address = request.client_addr
+                updated = True
 
-        return token + base64.b64encode(user_id_hash + hmac.new(
-            self._authentication_secret,
-            digestmod=hashlib.sha256,
-            msg=token.encode() + user_id_hash).digest(), b'_.').decode('ascii')
+            if updated:
+                redis_server.set(access_key.token, pickle.dumps(counterfoil), ex=counterfoil.timeout)
+            else:
+                redis_server.expire(access_key.token, counterfoil.timeout)
 
-    @staticmethod
-    def _generate_user_id_hash(user_id):
-        if not isinstance(user_id, str):
-            user_id = str(user_id)
+            return counterfoil
 
-        return hashlib.sha224(user_id.encode()).digest()[-4:]
+        return self._get_property(request, 'counterfoil', do_load)
+
+    def _push_access_key(self, request, access_key, timeout):
+        access_key = self._access_key_algorithm.generate(access_key)
+
+        headers = []
+
+        if self._to_header is not None:
+            headers.append((self._to_header, access_key))
+
+        if self._from_cookie is not None:
+            cookie_settings = {'max_age': timeout}
+
+            headers += self._cookie_profile(request).get_headers(access_key, **cookie_settings)
+        return headers
+
+    def _reset_access_key(self, request):
+        headers = []
+
+        if self._to_header is not None:
+            headers.append((self._to_header, ''))
+
+        if self._from_cookie is not None:
+            headers += self._cookie_profile(request).get_headers(None)
+
+        return headers
 
     def authenticated_userid(self, request):
-        for principal in request.effective_principals:
-            if principal.startswith('user:'):
-                return principal[len('user:'):]
+        counterfoil = self._load_counterfoil(request, self._load_access_key(request))
 
-        return None
-
-    def unauthenticated_userid(self, request):
-        info = self._get_auth_record_from_session(request)
-
-        if info is None:
+        if counterfoil is None:
             return None
 
-        # there is a authentication record in session
-        return info.user_id
+        return counterfoil.user_id
+
+    def unauthenticated_userid(self, request):
+        access_key = self._load_access_key(request)
+
+        if access_key is None:
+            return None
+
+        return access_key.user_id
 
     def effective_principals(self, request):
         principals = [Everyone]
 
-        token = None
-        user_id_checker = None
+        access_key = self._load_access_key(request)
+        counterfoil = self._load_counterfoil(request, access_key)
 
-        if token is None:
-            token, user_id_checker = self._get_token_from_access_key(request)
-
-        if token is None:
-            token, user_id_checker = self._get_token_from_session(request)
-
-        if token is None or user_id_checker is None:
-            return principals  # common principals
-
-        # there is a authentication record in session
-        redis_server = self._get_redis()
-        counterfoil = redis_server.get(token)
-
-        if counterfoil is None:
-            return principals  # common principals
-
-        # there is a counterfoil in Redis for user's token
-        try:
-            counterfoil = pickle.loads(counterfoil)  # type: _Counterfoil
-        except pickle.UnpicklingError:
-            self.forget(request)
-            return principals
-
-        if not user_id_checker(counterfoil.user_id):
-            self.forget(request)
-            return principals
-
-        if not self._counterfoil_checker(request, counterfoil.last_address, counterfoil.last_user_agent):
-            self.forget(request)
-            return principals
-
-        # the counterfoil belongs to the user
-        principals.append(Authenticated)
-        principals.append('user:{}'.format(counterfoil.user_id))
-        principals.append('token:{}'.format(token))
-        principals += self._callback(counterfoil.user_id, request)
-
-        updated = False
-
-        if counterfoil.last_user_agent != request.user_agent:
-            counterfoil.last_user_agent = request.user_agent
-            updated = True
-
-        if counterfoil.last_address != request.client_addr:
-            counterfoil.last_address = request.client_addr
-            updated = True
-
-        # extend lifetime of counterfoil
-        if updated:
-            redis_server.set(token, pickle.dumps(counterfoil), ex=counterfoil.timeout)
-        else:
-            redis_server.expire(token, counterfoil.timeout)
-
-        # update session
-        info = self._get_auth_record_from_session(request, create=True)
-        if info is not None:
-            info.token = token
-            info.user_id = counterfoil.user_id
+        if counterfoil is not None:
+            principals.append(Authenticated)
+            principals.append('user:{}'.format(counterfoil.user_id))
+            principals.append('token:{}'.format(binascii.hexlify(access_key.token)))
+            principals += self._callback(counterfoil.user_id, request)
 
         return principals
 
@@ -394,110 +382,47 @@ class RedisTokenAuthenticationPolicy:
                  request,
                  userid,
                  timeout=None,
-                 long_lifetime_cookie=False,
-                 the_token_generator=token_generator,
                  callback=None):
         if timeout is None:
             timeout = 7 * 24 * 60 * 60
 
-        redis_server = self._get_redis()
-
         user_id = str(userid)
 
+        authenticated_userid = self.authenticated_userid(request)
+
+        if authenticated_userid == user_id:
+            return []
+
+        if authenticated_userid is not None:
+            _, token = self._load_access_key(request)
+            self.revoke_token(token)
+
+        counterfoil = Counterfoil(user_id, timeout)
+
         token = None
-
-        def user_id_checker(user_id):
-            return False
-
-        if token is None:
-            token, user_id_checker = self._get_token_from_access_key(request)
-
-        if token is None:
-            token, user_id_checker = self._get_token_from_session(request)
-
-        class NoValidToken(BaseException):
-            pass
-
-        try:
-            if token is None:
-                raise NoValidToken
-
-            if not user_id_checker(user_id):
-                raise NoValidToken
-
-            counterfoil = redis_server.get(token)
-            if counterfoil is None:
-                raise NoValidToken
-
-            try:
-                counterfoil = pickle.loads(counterfoil)  # type: _Counterfoil
-            except pickle.UnpicklingError:
-                raise NoValidToken
-
-            if counterfoil.user_id != user_id:
-                raise NoValidToken
-
-            # update lifetime of counterfoil
-            counterfoil.timeout = timeout
-            redis_server.set(token, pickle.dumps(counterfoil), ex=counterfoil.timeout)
-        except NoValidToken:
-            counterfoil = _Counterfoil(user_id, timeout)
-
-            ret = None
-            token = None
-            while ret is None:
-                token = the_token_generator(self._token_length)
-                ret = redis_server.set(token, pickle.dumps(counterfoil), ex=counterfoil.timeout, nx=True)
+        redis_server = self._get_redis()
+        redis_response = None
+        while redis_response is None:
+            token = Random.get_random_bytes(self._token_length)
+            redis_response = redis_server.set(token, pickle.dumps(counterfoil), ex=counterfoil.timeout, nx=True)
 
         if callback is not None:
             callback(token)
 
-        info = self._get_auth_record_from_session(request, create=True)  # type: _AuthRecord
-
-        if info is not None:
-            info.user_id = user_id
-            info.token = token
-
-        access_key = self.generate_access_key(user_id, token)
-
-        if access_key is not None:
-            headers = []
-
-            if self._to_header is not None:
-                headers.append((self._to_header, access_key))
-
-            if self._from_cookie is not None:
-                if self._trusted_host is True or request.host in self._trusted_host:
-                    cookie_settings = {}
-
-                    if long_lifetime_cookie:
-                        cookie_settings['max_age'] = timeout
-
-                    headers += self._cookie_profile(request).get_headers(access_key, **cookie_settings)
-            return headers
-        else:
-            return []
+        return self._push_access_key(request, AccessKey(user_id, token), timeout)
 
     def forget(self, request):
-        token, _ = self._get_token_from_access_key(request)
+        access_key = self._load_access_key(request)
+
+        if access_key is None:
+            return []
+
+        token = access_key[1]
 
         if token is not None:
             self.revoke_token(token)
 
-        token, _ = self._get_token_from_session(request)
-        if token is not None:
-            self.revoke_token(token)
-        self._clean_auth_record_from_session(request)
-
-        headers = []
-
-        if self._to_header is not None:
-            headers.append((self._to_header, ''))
-
-        if self._from_cookie is not None:
-            if self._trusted_host is True or request.host in self._trusted_host:
-                headers += self._cookie_profile(request).get_headers(None)
-        return headers
+        return self._reset_access_key(request)
 
     def revoke_token(self, token):
         if token is None:
@@ -512,34 +437,20 @@ class RedisTokenAuthenticationPolicy:
         if counterfoil is None:
             return False
 
-        counterfoil = pickle.loads(counterfoil)  # type: _Counterfoil
+        counterfoil = pickle.loads(counterfoil)  # type: Counterfoil
         if counterfoil.user_id != userid:
             return False
 
         return True
-
-    def parse_principals(self, principals):
-        user_id = None
-        token = None
-
-        for principal in principals:
-            if principal.startswith('user:'):
-                user_id = principal[5:]
-            elif principal.startswith('token:'):
-                token = principal[6:]
-
-        return user_id, token
 
 
 def get_token_manager(request) -> RedisTokenAuthenticationPolicy:
     return request.registry.getUtility(ITokenManager)
 
 
+def set_token_manager(config, token_manager):
+    config.registry.registerUtility(token_manager, ITokenManager)
+
+
 def includeme(config):
-    def register_token_manager():
-        authentication_policy = config.registry.queryUtility(IAuthenticationPolicy)
-
-        if ITokenManager.providedBy(authentication_policy):
-            config.registry.registerUtility(authentication_policy, ITokenManager)
-
-    config.action('register_token_manager', register_token_manager, order=(PHASE2_CONFIG + 1))
+    config.add_directive('set_token_manager', set_token_manager)
